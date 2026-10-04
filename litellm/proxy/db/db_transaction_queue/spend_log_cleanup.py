@@ -27,6 +27,7 @@ from litellm.proxy.db.db_transaction_queue.spend_log_cleanup_metrics import (
 from litellm.proxy.db.db_transaction_queue.spend_logs_partition_manager import (
     RemainingTimeoutMs,
     SpendLogsPartitionManager,
+    bounded_tx,
 )
 from litellm.proxy.utils import PrismaClient
 
@@ -107,16 +108,16 @@ class SpendLogCleanup:
     next run resumes from where it left off, because the cutoff is recomputed
     and deleted rows are gone.
 
-    The budget is a hard wall clock, not an advisory one. Every statement this
-    job issues, deletes, the outstanding-rows probe and partition DDL alike, is
-    issued with a timeout clamped to the budget that is still left, so one
-    started just under the deadline is cancelled by Postgres at the deadline
-    rather than running a further batch timeout past it. No statement is issued
-    at all once the budget is spent, which is why the probe is skipped on that
-    path. Partition DDL additionally carries a lock_timeout, because it takes an
-    ACCESS EXCLUSIVE lock and would otherwise queue behind a long-running reader
-    for as long as that reader lives; a partition this run cannot get is left
-    for the next one.
+    The budget bounds issuing SQL and its statement/lock timeouts. No work
+    statement starts once the budget is spent. Transactions have an explicit
+    lifetime covering the remaining budget plus the partition manager's bounded
+    five-second completion allowance, so commit is not cut short by Prisma's
+    default transaction lifetime. Acquisition, setup and completion can add
+    bounded overhead; the budget is not an exact deadline for returning from
+    the run. Cancelling client work requests rollback but server work remains
+    bounded by PostgreSQL timeouts until rollback completes. Partition DDL
+    additionally carries a lock_timeout because it takes an ACCESS EXCLUSIVE
+    lock; a partition this run cannot get is left for the next one.
     """
 
     def __init__(
@@ -245,17 +246,17 @@ class SpendLogCleanup:
         The per-statement bound in milliseconds: the batch timeout, or whatever
         is left of the run budget, whichever is smaller.
 
-        Clamping to the remaining budget is what makes the budget a real
-        wall-clock bound rather than an advisory one. Postgres offers no "stop
-        at time T", only a per-statement duration, so a statement issued just
-        under the deadline would otherwise run a full batch timeout past it, and
-        with several tables those overruns stack.
+        Postgres offers per-statement durations rather than an absolute
+        deadline. Refresh this bound after acquisition/setup so new work does
+        not receive a full batch timeout when the run has less time left.
+        Zero means no work may start; it must never be sent as a SQL timeout,
+        where it would disable the bound.
 
         Interpolating this into SQL is safe by construction: an int cannot carry
         SQL, and SET does not accept a bind parameter.
         """
         remaining_ms: Final = int((deadline - time.monotonic()) * 1000)
-        return max(1, min(int(self.batch_timeout_seconds * 1000), remaining_ms))
+        return max(0, min(max(1, int(self.batch_timeout_seconds * 1000)), remaining_ms))
 
     @staticmethod
     def _group_deadline(overall_deadline: float, groups_remaining: int) -> float:
@@ -284,13 +285,13 @@ class SpendLogCleanup:
         """
 
         def remaining() -> int | None:
-            return None if time.monotonic() >= deadline else self._timeout_ms(deadline)
+            return self._timeout_ms(deadline) or None
 
         return remaining
 
     async def _execute_delete_batch(
         self, prisma_client: PrismaClient, delete_sql: str, cutoff_date: Cutoff, deadline: float
-    ) -> int | None:
+    ) -> int | Literal["budget_exhausted"] | None:
         """
         Run one delete batch under a Postgres statement and lock timeout.
 
@@ -300,15 +301,27 @@ class SpendLogCleanup:
         connection, and the row locks it already took, indefinitely. SET LOCAL
         scopes both to this transaction so the pooled connection is unaffected.
 
-        Returns the row count, or None when the driver returned something that
-        is not a row count. That is a contract violation rather than a transient
-        fault, so the caller stops instead of retrying.
+        Returns the committed row count, budget_exhausted when no work could
+        start, or None when the driver returned something that is not a row
+        count. The latter is a contract violation, so the caller stops instead
+        of retrying.
         """
-        timeout_ms: Final = self._timeout_ms(deadline)
-        async with prisma_client.db.tx() as tx:
-            await tx.execute_raw(f"SET LOCAL statement_timeout = {timeout_ms}")
-            await tx.execute_raw(f"SET LOCAL lock_timeout = {timeout_ms}")
-            deleted_result: Final = await tx.execute_raw(delete_sql, cutoff_date, self.batch_size)
+        transaction_budget_ms: Final = int((deadline - time.monotonic()) * 1000)
+        if transaction_budget_ms <= 0:
+            return "budget_exhausted"
+        remaining_timeout_ms: Final = self._remaining_timeout_ms(deadline)
+        async with bounded_tx(prisma_client, transaction_budget_ms) as tx:
+            if (lock_timeout_ms := remaining_timeout_ms()) is None:
+                return "budget_exhausted"
+            await tx.execute_raw(f"SET LOCAL lock_timeout = {lock_timeout_ms}")
+            if (statement_timeout_ms := remaining_timeout_ms()) is None:
+                return "budget_exhausted"
+            await tx.execute_raw(f"SET LOCAL statement_timeout = {statement_timeout_ms}")
+            if (work_timeout_ms := remaining_timeout_ms()) is None:
+                return "budget_exhausted"
+            deleted_result: Final = await asyncio.wait_for(
+                tx.execute_raw(delete_sql, cutoff_date, self.batch_size), timeout=work_timeout_ms / 1000
+            )
         return deleted_result if isinstance(deleted_result, int) else None
 
     async def _count_remaining(
@@ -329,11 +342,22 @@ class SpendLogCleanup:
                 LIMIT $2
             ) capped
             """
+        transaction_budget_ms: Final = int((deadline - time.monotonic()) * 1000)
+        if transaction_budget_ms <= 0:
+            return None
+        remaining_timeout_ms: Final = self._remaining_timeout_ms(deadline)
         try:
-            async with prisma_client.db.tx() as tx:
-                await tx.execute_raw(f"SET LOCAL statement_timeout = {self._timeout_ms(deadline)}")
+            async with bounded_tx(prisma_client, transaction_budget_ms) as tx:
+                if (statement_timeout_ms := remaining_timeout_ms()) is None:
+                    return None
+                await tx.execute_raw(f"SET LOCAL statement_timeout = {statement_timeout_ms}")
+                if (work_timeout_ms := remaining_timeout_ms()) is None:
+                    return None
                 rows: Final = _REMAINING_ROWS.validate_python(
-                    await tx.query_raw(count_sql, cutoff_date, SPEND_LOG_CLEANUP_REMAINING_COUNT_CAP)
+                    await asyncio.wait_for(
+                        tx.query_raw(count_sql, cutoff_date, SPEND_LOG_CLEANUP_REMAINING_COUNT_CAP),
+                        timeout=work_timeout_ms / 1000,
+                    )
                 )
         except Exception as e:  # noqa: BLE001 - an observability probe must never fail the cleanup run
             verbose_proxy_logger.warning("Could not count remaining %s rows: %s", table_name, e)
@@ -435,6 +459,10 @@ class SpendLogCleanup:
                 await asyncio.sleep(SPEND_LOG_CLEANUP_BATCH_FAILURE_BACKOFF_SECONDS)
                 continue
 
+            if batch_result == "budget_exhausted":
+                return await self._finish_table(
+                    prisma_client, cutoff_date, table_name, time_column, total_deleted, "budget_exhausted", deadline
+                )
             if batch_result is None:
                 verbose_proxy_logger.error(
                     "Unexpected execute_raw return type for %s cleanup; aborting cleanup to avoid infinite loop",
