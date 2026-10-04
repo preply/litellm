@@ -6,9 +6,11 @@ import asyncio
 import logging
 import math
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Final
+from types import SimpleNamespace
+from typing import Final, Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -47,7 +49,7 @@ def _wire_tx(db):
     """
 
     @asynccontextmanager
-    async def _tx():
+    async def _tx(*, timeout: timedelta):
         tx = MagicMock()
 
         async def _execute_raw(sql, *args):
@@ -100,6 +102,7 @@ def test_spend_log_cleanup_cron_scheduler_integration():
     a real database connection.
     """
     from unittest.mock import MagicMock
+
     from apscheduler.triggers.cron import CronTrigger
 
     # Mock scheduler
@@ -801,14 +804,16 @@ async def test_spend_logs_retention_alone_does_not_touch_the_session_rollup():
 
 @pytest.mark.asyncio
 async def test_session_retention_alone_cleans_both_session_rollups():
-    client = _mock_prisma_for_retention([0, 0])
+    client = _mock_prisma_for_retention([0, 0, 0, 0])
     cleaner = SpendLogCleanup(general_settings={"maximum_autorouter_session_retention_period": "365d"})
     cleaner.pod_lock_manager = None
     await cleaner.cleanup_old_spend_logs(client)
     tables = [call[0][0] for call in client.db.execute_raw.call_args_list]
-    assert len(tables) == 2
-    assert '"LiteLLM_AutoRouterSession"' in tables[0]
-    assert '"LiteLLM_AutoRouterUserSession"' in tables[1]
+    assert len(tables) == 4
+    assert '"LiteLLM_AutoRouterBaselineComparison"' in tables[0]
+    assert '"LiteLLM_AutoRouterBaselineObservation"' in tables[1]
+    assert '"LiteLLM_AutoRouterSession"' in tables[2]
+    assert '"LiteLLM_AutoRouterUserSession"' in tables[3]
 
 
 @pytest.mark.asyncio
@@ -852,7 +857,7 @@ async def test_spend_logs_retention_alone_keeps_daily_tag_spend_forever():
 
 @pytest.mark.asyncio
 async def test_each_retention_key_cuts_off_at_its_own_horizon():
-    client = _mock_prisma_for_retention([0, 0, 0, 0, 0])
+    client = _mock_prisma_for_retention([0, 0, 0, 0, 0, 0, 0])
     cleaner = SpendLogCleanup(
         general_settings={
             "maximum_spend_logs_retention_period": "7d",
@@ -870,6 +875,8 @@ async def test_each_retention_key_cuts_off_at_its_own_horizon():
             if '"LiteLLM_AutoRouterUserSession"' in call[0][0]
             else "LiteLLM_HealthCheckTable"
             if '"LiteLLM_HealthCheckTable"' in call[0][0]
+            else "baseline"
+            if '"LiteLLM_AutoRouterBaseline' in call[0][0]
             else "logs"
         ): call[0][1]
         for call in client.db.execute_raw.call_args_list
@@ -877,6 +884,7 @@ async def test_each_retention_key_cuts_off_at_its_own_horizon():
     now = datetime.now(timezone.utc)
     assert (now - cutoffs["logs"]).days == 7
     assert (now - cutoffs["LiteLLM_AutoRouterSession"]).days == 365
+    assert cutoffs["baseline"] == cutoffs["LiteLLM_AutoRouterSession"]
     assert cutoffs["LiteLLM_AutoRouterUserSession"] == cutoffs["LiteLLM_AutoRouterSession"]
     assert (now - cutoffs["LiteLLM_HealthCheckTable"]).days == 30
 
@@ -1004,7 +1012,7 @@ async def test_each_batch_carries_a_statement_and_lock_timeout():
     mock_db = MagicMock()
 
     @asynccontextmanager
-    async def _tx():
+    async def _tx(*, timeout: timedelta):
         tx = MagicMock()
 
         async def _execute_raw(sql, *args):
@@ -1213,7 +1221,7 @@ async def test_the_outstanding_rows_probe_carries_a_statement_timeout():
     mock_db = MagicMock()
 
     @asynccontextmanager
-    async def _tx():
+    async def _tx(*, timeout: timedelta):
         tx = MagicMock()
 
         async def _execute_raw(sql, *args):
@@ -1265,7 +1273,7 @@ async def test_a_statement_timeout_is_clamped_to_the_budget_that_is_left():
     client = MagicMock()
 
     @asynccontextmanager
-    async def _tx():
+    async def _tx(*, timeout: timedelta):
         tx = MagicMock()
 
         async def _execute_raw(sql, *args):
@@ -1292,6 +1300,257 @@ async def test_a_statement_timeout_is_clamped_to_the_budget_that_is_left():
     assert timeouts, f"no statement timeout was issued: {recorded}"
     issued_ms = int(timeouts[0].split("=")[1].strip())
     assert issued_ms <= 2000, f"the batch was given {issued_ms}ms with only 2000ms of budget left"
+
+
+class _CleanupClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _TimedCleanupDatabase:
+    def __init__(
+        self,
+        clock: _CleanupClock,
+        *,
+        work_seconds: float = 0,
+        work_wait_seconds: float = 0,
+        acquisition_seconds: float = 0,
+        setup_seconds: tuple[float, ...] = (),
+        commit_seconds: float = 0,
+        commit_failures: int = 0,
+        cancel_at: Literal["work", "commit"] | None = None,
+    ) -> None:
+        self.clock = clock
+        self.work_seconds = work_seconds
+        self.work_wait_seconds = work_wait_seconds
+        self.acquisition_seconds = acquisition_seconds
+        self.setup_seconds = setup_seconds
+        self.commit_seconds = commit_seconds
+        self.commit_failures = commit_failures
+        self.cancel_at = cancel_at
+        self.statements: tuple[str, ...] = ()
+        self.transactions = 0
+        self.commits = 0
+        self.rollbacks = 0
+        self.setup_count = 0
+        self.transaction_timeout: timedelta | None = None
+
+    @asynccontextmanager
+    async def tx(self, *, timeout: timedelta | None = None) -> AsyncIterator["_TimedCleanupDatabase"]:
+        self.transactions += 1
+        self.transaction_timeout = timeout
+        self.clock.now += self.acquisition_seconds
+        started_at: Final = self.clock.now
+        try:
+            yield self
+        except BaseException:
+            self.rollbacks += 1
+            raise
+        self.clock.now += self.commit_seconds
+        if self.cancel_at == "commit":
+            raise asyncio.CancelledError
+        lifetime: Final = timeout.total_seconds() if timeout is not None else self.work_seconds / 2
+        if self.clock.now - started_at > lifetime:
+            raise RuntimeError("transaction expired before commit")
+        if self.commit_failures:
+            self.commit_failures -= 1
+            raise RuntimeError("commit failed")
+        self.commits += 1
+
+    async def execute_raw(self, sql: str, *args: object) -> int:
+        self.statements += (sql.strip(),)
+        if sql.startswith("SET LOCAL"):
+            delay: Final = self.setup_seconds[self.setup_count] if self.setup_count < len(self.setup_seconds) else 0
+            self.setup_count += 1
+            self.clock.now += delay
+            return 0
+        self.clock.now += self.work_seconds
+        await asyncio.sleep(self.work_wait_seconds)
+        if self.cancel_at == "work":
+            raise asyncio.CancelledError
+        return 7
+
+    async def query_raw(self, sql: str, *args: object) -> list[dict[str, int]]:
+        await self.execute_raw(sql, *args)
+        return [{"remaining": 7}]
+
+
+@pytest.fixture
+def cleanup_clock(monkeypatch: pytest.MonkeyPatch) -> _CleanupClock:
+    import litellm.proxy.db.db_transaction_queue.spend_log_cleanup as cleanup_module
+
+    clock: Final = _CleanupClock()
+    monkeypatch.setattr(cleanup_module, "time", SimpleNamespace(monotonic=clock.monotonic))
+    return clock
+
+
+async def _timed_cleanup_result(
+    cleaner: SpendLogCleanup, db: _TimedCleanupDatabase, operation: Literal["delete", "count"], deadline: float
+) -> int | Literal["budget_exhausted"] | None:
+    client: Final = MagicMock(db=db)
+    cutoff: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    if operation == "delete":
+        return await cleaner._execute_delete_batch(client, "DELETE FROM logs", cutoff, deadline)
+    return await cleaner._count_remaining(client, cutoff, "logs", "startTime", deadline)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("delete", "count"))
+async def test_cleanup_transaction_outlives_work_and_counts_after_commit(
+    cleanup_clock: _CleanupClock, operation: Literal["delete", "count"]
+) -> None:
+    db: Final = _TimedCleanupDatabase(cleanup_clock, work_seconds=8, commit_seconds=2)
+    cleaner: Final = SpendLogCleanup(general_settings={"maximum_spend_logs_cleanup_batch_timeout": "12s"})
+
+    result: Final = await _timed_cleanup_result(cleaner, db, operation, cleanup_clock.now + 30)
+
+    assert result == 7
+    assert db.commits == 1
+    assert db.rollbacks == 0
+    assert db.transaction_timeout is not None
+    assert db.transaction_timeout.total_seconds() >= db.work_seconds + db.commit_seconds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("delete", "count"))
+@pytest.mark.parametrize("stage", ("before_entry", "acquisition", "setup"))
+async def test_expired_cleanup_budget_never_starts_delete_or_probe(
+    cleanup_clock: _CleanupClock, operation: Literal["delete", "count"], stage: str
+) -> None:
+    db: Final = _TimedCleanupDatabase(
+        cleanup_clock,
+        acquisition_seconds=2 if stage == "acquisition" else 0,
+        setup_seconds=(2,) if stage == "setup" else (),
+    )
+    cleaner: Final = SpendLogCleanup(general_settings={"maximum_spend_logs_retention_period": "7d"})
+    deadline: Final = cleanup_clock.now + (-1 if stage == "before_entry" else 1)
+
+    result: Final = await _timed_cleanup_result(cleaner, db, operation, deadline)
+
+    assert result == ("budget_exhausted" if operation == "delete" else None)
+    assert all(sql.startswith("SET LOCAL") for sql in db.statements)
+    assert db.transactions == (0 if stage == "before_entry" else 1)
+    assert len(db.statements) == (1 if stage == "setup" else 0)
+
+
+@pytest.mark.asyncio
+async def test_delete_recomputes_statement_budget_after_acquisition_and_lock_setup(
+    cleanup_clock: _CleanupClock,
+) -> None:
+    db: Final = _TimedCleanupDatabase(cleanup_clock, acquisition_seconds=4, setup_seconds=(3,))
+    cleaner: Final = SpendLogCleanup(general_settings={"maximum_spend_logs_cleanup_batch_timeout": "30s"})
+
+    result: Final = await _timed_cleanup_result(cleaner, db, "delete", cleanup_clock.now + 30)
+
+    assert result == 7
+    assert db.statements == (
+        "SET LOCAL lock_timeout = 26000",
+        "SET LOCAL statement_timeout = 23000",
+        "DELETE FROM logs",
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_does_not_start_after_statement_timeout_setup_spends_budget(cleanup_clock: _CleanupClock) -> None:
+    db: Final = _TimedCleanupDatabase(cleanup_clock, setup_seconds=(0, 2))
+    cleaner: Final = SpendLogCleanup(general_settings={"maximum_spend_logs_retention_period": "7d"})
+
+    result: Final = await _timed_cleanup_result(cleaner, db, "delete", cleanup_clock.now + 1)
+
+    assert result == "budget_exhausted"
+    assert db.statements == ("SET LOCAL lock_timeout = 1000", "SET LOCAL statement_timeout = 1000")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("delete", "count"))
+async def test_work_deadline_is_refreshed_after_the_final_set_and_requests_rollback(
+    cleanup_clock: _CleanupClock, operation: Literal["delete", "count"]
+) -> None:
+    db: Final = _TimedCleanupDatabase(
+        cleanup_clock,
+        work_wait_seconds=0.08,
+        setup_seconds=(0, 0.06) if operation == "delete" else (0.06,),
+    )
+    cleaner: Final = SpendLogCleanup(general_settings={"maximum_spend_logs_retention_period": "7d"})
+    deadline: Final = cleanup_clock.now + 0.1
+    if operation == "delete":
+        with pytest.raises(asyncio.TimeoutError):
+            await _timed_cleanup_result(cleaner, db, operation, deadline)
+    else:
+        result: Final = await _timed_cleanup_result(cleaner, db, operation, deadline)
+        assert result is None
+    assert db.commits == 0
+    assert db.rollbacks == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("delete", "count"))
+async def test_cleanup_commit_failure_never_returns_uncommitted_count(
+    cleanup_clock: _CleanupClock, operation: Literal["delete", "count"]
+) -> None:
+    db: Final = _TimedCleanupDatabase(cleanup_clock, commit_failures=1)
+    cleaner: Final = SpendLogCleanup(general_settings={"maximum_spend_logs_retention_period": "7d"})
+    if operation == "delete":
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await _timed_cleanup_result(cleaner, db, operation, cleanup_clock.now + 30)
+    else:
+        result: Final = await _timed_cleanup_result(cleaner, db, operation, cleanup_clock.now + 30)
+        assert result is None
+    assert db.commits == 0
+    assert db.rollbacks == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("delete", "count"))
+@pytest.mark.parametrize("cancel_at", ("work", "commit"))
+async def test_cleanup_cancellation_propagates_without_returning_a_row_count(
+    cleanup_clock: _CleanupClock, operation: Literal["delete", "count"], cancel_at: Literal["work", "commit"]
+) -> None:
+    db: Final = _TimedCleanupDatabase(cleanup_clock, cancel_at=cancel_at)
+    cleaner: Final = SpendLogCleanup(general_settings={"maximum_spend_logs_retention_period": "7d"})
+
+    with pytest.raises(asyncio.CancelledError):
+        await _timed_cleanup_result(cleaner, db, operation, cleanup_clock.now + 30)
+
+    assert db.commits == 0
+    assert db.rollbacks == (1 if cancel_at == "work" else 0)
+
+
+@pytest.mark.asyncio
+async def test_successful_cleanup_commit_crossing_deadline_still_counts_rows(cleanup_clock: _CleanupClock) -> None:
+    db: Final = _TimedCleanupDatabase(cleanup_clock, work_seconds=1, commit_seconds=2)
+    client: Final = MagicMock(db=db)
+    cleaner: Final = SpendLogCleanup(general_settings={"maximum_spend_logs_retention_period": "7d"})
+
+    result: Final = await cleaner._delete_old_logs(
+        client, datetime(2026, 1, 1, tzinfo=timezone.utc), cleanup_clock.now + 2
+    )
+
+    assert result.rows_deleted == 7
+    assert result.stop_reason == "budget_exhausted"
+    assert db.commits == 1
+    assert sum(sql.startswith("DELETE") for sql in db.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_commit_does_not_contribute_rows_to_a_resumed_cleanup_loop(cleanup_clock: _CleanupClock) -> None:
+    db: Final = _TimedCleanupDatabase(cleanup_clock, commit_failures=1)
+    client: Final = MagicMock(db=db)
+    cleaner: Final = SpendLogCleanup(
+        general_settings={"maximum_spend_logs_retention_period": "7d", "maximum_spend_logs_cleanup_max_batches": 1}
+    )
+
+    result: Final = await cleaner._delete_old_logs(
+        client, datetime(2026, 1, 1, tzinfo=timezone.utc), cleanup_clock.now + 30
+    )
+
+    assert result.rows_deleted == 7
+    assert result.stop_reason == "batch_cap_reached"
+    assert sum(sql.startswith("DELETE") for sql in db.statements) == 2
+    assert db.commits == 2
 
 
 @pytest.mark.asyncio
